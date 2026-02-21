@@ -4,10 +4,12 @@ from typing import Optional, List
 from fastapi import APIRouter, Query
 
 from .tools import get_github_tools
+from .code_quality_agent import get_code_quality_agent
 from models import (
     RepositorySearchResponse,
     ContributorsResponse,
     ContributorCommitsResponse,
+    CodeQualityResponse,
 )
 
 # Create router for GitHub endpoints
@@ -177,6 +179,107 @@ async def get_all_contributors_commits(
 
 
 # ============================================================================
+# Code Quality Analysis Routes
+# ============================================================================
+
+@router.get("/repos/{owner}/{repo}/contributors/{contributor}/quality", response_model=CodeQualityResponse)
+async def analyze_contributor_code_quality(
+    owner: str,
+    repo: str,
+    contributor: str,
+    max_results: int = Query(10, ge=1, le=50, description="Maximum commits to grade"),
+):
+    """
+    Grade code quality of a contributor's commits using AI.
+    
+    Provides objective quality scores (0-100) across multiple dimensions:
+    - Maintainability: Code structure and modularity
+    - Readability: Code clarity and documentation
+    - Test Coverage: Testing practices
+    - Complexity: Code simplicity (higher = simpler)
+    - Performance: Performance characteristics
+    - Security: Security practices
+    
+    Args:
+        owner: Repository owner/organization name
+        repo: Repository name
+        contributor: Contributor login name
+        max_results: Maximum number of commits to grade
+    
+    Returns:
+        Quality grades for each commit
+    """
+    print(f"\n[API] Code quality grading requested for {owner}/{repo} contributor: {contributor}")
+    print(f"[API] Max commits to grade: {max_results}")
+    
+    try:
+        print(f"[API] Initializing GitHub tools...")
+        github_tools = get_github_tools()
+        print(f"[API] Initializing code quality agent...")
+        agent = get_code_quality_agent()
+        
+        # Get commits for the contributor
+        print(f"[API] Fetching commits for contributor {contributor}...")
+        commits_response = github_tools.get_commits(
+            owner=owner,
+            repo=repo,
+            contributor=contributor,
+            max_results=max_results
+        )
+        print(f"[API] Fetched {commits_response.total_commits} commits")
+        
+        if not commits_response.success:
+            print(f"[API] ERROR: Failed to fetch commits - {commits_response.error}")
+            return CodeQualityResponse(
+                owner=owner,
+                repo=repo,
+                contributor=contributor,
+                metrics=[],
+                total_analyzed=0,
+                success=False,
+                error=commits_response.error
+            )
+        
+        # Analyze each commit's quality
+        print(f"[API] Preparing {len(commits_response.commits)} commits for grading...")
+        commits_data = [
+            {
+                "sha": commit.sha,
+                "diff": commit.diff or "",
+                "message": commit.message
+            }
+            for commit in commits_response.commits
+        ]
+        
+        print(f"[API] Starting AI grading...")
+        metrics = await agent.analyze_commits_batch(commits_data)
+        print(f"[API] Grading complete! Generated {len(metrics)} quality reports")
+        
+        return CodeQualityResponse(
+            owner=owner,
+            repo=repo,
+            contributor=contributor,
+            metrics=metrics,
+            total_analyzed=len(metrics),
+            success=True
+        )
+    
+    except Exception as e:
+        print(f"[API] ERROR: Exception during code quality grading - {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return CodeQualityResponse(
+            owner=owner,
+            repo=repo,
+            contributor=contributor,
+            metrics=[],
+            total_analyzed=0,
+            success=False,
+            error=str(e)
+        )
+
+
+# ============================================================================
 # Health Check Route
 # ============================================================================
 
@@ -192,6 +295,7 @@ async def github_api_health():
             "GET /api/github/repos/{owner}/{repo}/contributors",
             "GET /api/github/repos/{owner}/{repo}/contributors/{contributor}/commits",
             "GET /api/github/repos/{owner}/{repo}/contributors/commits/all",
+            "GET /api/github/repos/{owner}/{repo}/contributors/{contributor}/quality",
             "GET /api/github/health",
         ]
     }
