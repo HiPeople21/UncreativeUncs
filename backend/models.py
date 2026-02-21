@@ -109,3 +109,27 @@ class ContributorCommitsResponse(BaseModel):
     total_commits: int
     success: bool
     error: Optional[str] = None
+
+class CodeQualityMetric(BaseModel):
+    """Code quality grading for a commit."""
+    commit_sha: str
+    overall_score: float = Field(..., ge=0, le=100, description="Overall quality score 0-100")
+    maintainability: float = Field(..., ge=0, le=100, description="Code structure and modularity grade")
+    readability: float = Field(..., ge=0, le=100, description="Code clarity and documentation grade")
+    test_coverage: float = Field(..., ge=0, le=100, description="Testing practices grade")
+    complexity: float = Field(..., ge=0, le=100, description="Code simplicity grade (higher = simpler)")
+    performance: float = Field(..., ge=0, le=100, description="Performance characteristics grade")
+    security: float = Field(..., ge=0, le=100, description="Security practices grade")
+    issues: List[str] = Field(default_factory=list, description="Critical issues identified")
+    suggestions: List[str] = Field(default_factory=list, description="Grade justifications")
+
+
+class CodeQualityResponse(BaseModel):
+    """Response model for code quality analysis."""
+    owner: str
+    repo: str
+    contributor: str
+    metrics: List[CodeQualityMetric]
+    total_analyzed: int
+    success: bool
+    error: Optional[str] = None
