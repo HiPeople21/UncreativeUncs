@@ -9,6 +9,7 @@ Candidate search pipeline:
 import asyncio
 import hashlib
 import json
+import os
 import re
 import time
 from urllib.parse import urlparse
@@ -21,7 +22,7 @@ from models import Candidate, SearchFilters
 
 # ── Config ────────────────────────────────────────────────────────────
 CACHE_TTL = 300
-DDG_TIMEOUT = 50          # DDG can take 30-45s; give it room
+DDG_TIMEOUT = 20           # Per-request HTTP timeout inside DDGS session
 GITHUB_TIMEOUT = 180      # Includes Ollama commit analysis time
 OLLAMA_TIMEOUT = 30
 MAX_DDG_RESULTS = 50
@@ -32,6 +33,7 @@ OLLAMA_MODEL = "llama3"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 _cache: dict[str, tuple[float, list[Candidate]]] = {}
+_search_status: dict[str, str] = {}   # thread-safe flag channel
 
 
 # ── Ollama helpers ────────────────────────────────────────────────────
@@ -142,8 +144,106 @@ def _skill_to_github_tag(skill: str) -> str:
     return _GITHUB_TAG_MAP.get(lowered, re.sub(r"[^a-z0-9\-]", "-", lowered).strip("-"))
 
 
+
+# ── LinkedIn → GitHub enrichment ──────────────────────────────────────
+_GITHUB_NON_USER = {
+    "orgs", "sponsors", "topics", "trending", "marketplace",
+    "features", "explore", "apps", "settings", "login", "about",
+    "collections", "events", "pulls", "issues", "notifications",
+}
+
+def _extract_github_username(text: str) -> str | None:
+    """Extract a GitHub username mentioned anywhere in profile text."""
+    m = re.search(
+        r'github\.com/([a-zA-Z0-9][a-zA-Z0-9\-]{0,37}[a-zA-Z0-9]|[a-zA-Z0-9]{1,39})',
+        text, re.IGNORECASE,
+    )
+    if not m:
+        return None
+    username = m.group(1)
+    return None if username.lower() in _GITHUB_NON_USER else username
+
+
+def _get_user_best_repo(username: str) -> tuple[str, str] | None:
+    """Find the user's most-starred GitHub repository via the search API."""
+    token = os.getenv("GITHUB_TOKEN")
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+    try:
+        resp = requests.get(
+            "https://api.github.com/search/repositories",
+            params={"q": f"user:{username}", "sort": "stars", "order": "desc", "per_page": 1},
+            headers=headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+        if items:
+            repo = items[0]
+            owner = (repo.get("owner") or {}).get("login", username)
+            return owner, repo.get("name", "")
+    except Exception as e:
+        print(f"[LinkedIn→GitHub] Repo lookup failed for @{username}: {e}")
+    return None
+
+
+def _enhance_linkedin_with_github(candidate: Candidate) -> Candidate:
+    """
+    If the LinkedIn snippet mentions a GitHub URL, fetch their commits, run
+    Ollama code-quality analysis, and blend the score:
+        blended = linkedin_score × 0.6 + code_quality × 0.4
+    Returns the (possibly enhanced) candidate.
+    """
+    full_text = f"{candidate.headline} {candidate.snippet}"
+    username = _extract_github_username(full_text)
+    if not username:
+        return candidate
+
+    github_url = f"https://github.com/{username}"
+    print(f"[LinkedIn→GitHub] @{username} found on {candidate.name}'s profile")
+
+    repo_info = _get_user_best_repo(username)
+    if not repo_info:
+        # Link the profile even without a code review
+        return candidate.model_copy(update={"github_url": github_url})
+
+    owner, repo_name = repo_info
+    print(f"[LinkedIn→GitHub] Analysing @{username} via {owner}/{repo_name}...")
+
+    gh = get_github_tools()
+    commits: list = []
+    try:
+        cr = gh.get_commits(owner, repo_name, username, max_results=MAX_COMMITS_PER_CONTRIB)
+        if cr.success:
+            commits = cr.commits
+    except Exception:
+        pass
+
+    code_score, code_summary = _analyze_commits(username, owner, repo_name, commits)
+
+    # Blend: professional experience (60%) + code quality (40%)
+    blended = max(1, min(100, int(candidate.score * 0.6 + code_score * 0.4)))
+
+    enhanced_summary = (
+        f"{candidate.summary} "
+        f"GitHub code review ({owner}/{repo_name}): {code_summary}"
+    )
+    print(
+        f"[LinkedIn→GitHub] {candidate.name}: "
+        f"linkedin={candidate.score}, code={code_score}, blended={blended}"
+    )
+
+    return candidate.model_copy(update={
+        "github_url": github_url,
+        "code_quality_score": code_score,
+        "score": blended,
+        "summary": enhanced_summary[:600],
+    })
+
 # ── LinkedIn search ───────────────────────────────────────────────────
 def _search_linkedin(query: str) -> list[dict]:
+    _search_status.pop("linkedin_error", None)
     print(f"[LinkedIn] Query: {query}")
     try:
         with DDGS(timeout=DDG_TIMEOUT) as ddgs:
@@ -155,14 +255,23 @@ def _search_linkedin(query: str) -> list[dict]:
             for r in results
         ]
     except Exception as e:
-        print(f"[LinkedIn] Failed: {e}")
+        err_str = str(e)
+        if "429" in err_str or "Too Many Requests" in err_str:
+            print(f"[LinkedIn] Rate limited by search provider")
+            _search_status["linkedin_error"] = "rate_limited"
+        else:
+            print(f"[LinkedIn] Failed: {e}")
         return []
 
 
 def _score_linkedin(matched_skills: list[str], total_skills: int, exp_level: str,
                     location: str, required_exp: str, required_loc: str) -> tuple[int, str]:
-    """Score a LinkedIn candidate 1-100 using a deterministic formula."""
-    skill_score = int((len(matched_skills) / max(total_skills, 1)) * 50)
+    """Score a LinkedIn candidate 1-100 using a deterministic formula.
+
+    LinkedIn profiles are weighted higher than GitHub contributors — they represent
+    verified professional experience. +15 source bonus over equivalent GitHub score.
+    """
+    skill_score = int((len(matched_skills) / max(total_skills, 1)) * 55)  # 0-55
 
     exp_score = 0
     if required_exp and required_exp.lower() in exp_level.lower():
@@ -170,11 +279,12 @@ def _score_linkedin(matched_skills: list[str], total_skills: int, exp_level: str
 
     loc_score = 0
     if required_loc and required_loc.lower() in location.lower():
-        loc_score = 20
+        loc_score = 15
 
-    quality_score = 10  # base
+    linkedin_bonus = 10   # professional profile weight vs GitHub code-only score
+    quality_score = 0     # replaced by linkedin_bonus
 
-    score = max(1, min(100, skill_score + exp_score + loc_score + quality_score))
+    score = max(1, min(100, skill_score + exp_score + loc_score + linkedin_bonus + quality_score))
 
     reasons = []
     if matched_skills:
@@ -324,8 +434,9 @@ def _search_github_with_analysis(skills: list[str]) -> list[Candidate]:
 
             code_score, summary = _analyze_commits(login, owner, repo_name, commits)
 
-            # Final score: code quality (70%) + guaranteed skill relevance (30%)
-            final_score = max(1, min(100, int(code_score * 0.7 + 30)))
+            # GitHub score capped at 65 so LinkedIn profiles (which carry verified
+            # professional experience) naturally rank above equivalent GitHub contributors.
+            final_score = max(1, min(65, int(code_score * 0.35 + 30)))
 
             github_url = f"https://github.com/{login}"
             cid = hashlib.md5(github_url.encode()).hexdigest()[:12]
@@ -401,13 +512,15 @@ async def stream_candidate_search(filters: SearchFilters):
     yield {"type": "progress", "stage": "linkedin", "message": "Searching LinkedIn profiles..."}
 
     async def safe_linkedin() -> list[dict]:
+        # NOTE: Do NOT wrap in asyncio.wait_for — it cancels the wrapper but NOT the
+        # underlying thread (asyncio.to_thread threads can't be interrupted). That causes
+        # wait_for to fire and return [], while the thread keeps running and discards
+        # its results. Instead let the thread run naturally; DDGS handles its own
+        # per-request HTTP timeout via DDG_TIMEOUT passed to DDGS(timeout=...).
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(_search_linkedin, linkedin_query),
-                timeout=float(DDG_TIMEOUT),
-            )
+            return await asyncio.to_thread(_search_linkedin, linkedin_query)
         except Exception as e:
-            print(f"[LinkedIn] Timed out: {e}")
+            print(f"[LinkedIn] Failed: {e}")
             return []
 
     async def safe_github() -> list[Candidate]:
@@ -431,6 +544,15 @@ async def stream_candidate_search(filters: SearchFilters):
     linkedin_raw, github_candidates = await asyncio.gather(safe_linkedin(), safe_github())
     print(f"[Search] Done — {len(linkedin_raw)} LinkedIn raw, {len(github_candidates)} GitHub scored")
 
+    # Inform frontend if LinkedIn was rate-limited
+    if _search_status.get("linkedin_error") == "rate_limited":
+        yield {
+            "type": "progress",
+            "stage": "warning",
+            "message": "LinkedIn search rate-limited — showing GitHub results only.",
+            "detail": "Try again in a minute or broaden your description.",
+        }
+
     # Step 3: Parse LinkedIn, score, and merge
     yield {"type": "progress", "stage": "score", "message": "Ranking all candidates by score..."}
 
@@ -448,6 +570,31 @@ async def stream_candidate_search(filters: SearchFilters):
         if dk and dk not in seen:
             seen.add(dk)
             linkedin_candidates.append(c)
+
+    # Step 3.5: Enhance LinkedIn candidates whose snippet mentions a GitHub URL
+    github_linked = [
+        c for c in linkedin_candidates
+        if _extract_github_username(f"{c.headline} {c.snippet}")
+    ][:5]  # limit to top 5 to keep total time reasonable
+
+    if github_linked:
+        yield {
+            "type": "progress",
+            "stage": "enhance",
+            "message": f"Found GitHub on {len(github_linked)} LinkedIn profile(s) — running code review...",
+            "detail": "Blending professional experience with commit quality",
+        }
+        enhanced_map: dict[str, Candidate] = {}
+        for lc in github_linked:
+            try:
+                enhanced = await asyncio.wait_for(
+                    asyncio.to_thread(_enhance_linkedin_with_github, lc),
+                    timeout=60.0,
+                )
+                enhanced_map[lc.id] = enhanced
+            except Exception as e:
+                print(f"[LinkedIn→GitHub] Timed out for {lc.name}: {e}")
+        linkedin_candidates = [enhanced_map.get(c.id, c) for c in linkedin_candidates]
 
     for c in github_candidates:
         dk = _canonicalize_url(c.profile_url)

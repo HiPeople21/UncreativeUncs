@@ -654,6 +654,10 @@ body {
   color: var(--danger);
 }
 
+.agent-step-warning .step-message {
+  color: #fbbf24;
+}
+
 /* ---- Candidate List (Row-based Ranking) ---- */
 .candidate-list {
   display: flex;

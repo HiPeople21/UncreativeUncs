@@ -80,6 +80,8 @@ export default function App() {
             case "linkedin": return "💼";
             case "search": return "🔍";
             case "score": return "📊";
+            case "enhance": return "🔎";
+            case "warning": return "⚠️";
             default: return "⏳";
         }
     }
@@ -155,7 +157,7 @@ export default function App() {
                             </div>
                             <div className="agent-steps">
                                 {progressSteps.map((step, i) => (
-                                    <div key={i} className="agent-step agent-step-success">
+                                    <div key={i} className={`agent-step agent-step-${step.stage === "warning" ? "warning" : "success"}`}>
                                         <span className="step-icon">{stageIcon(step.stage)}</span>
                                         <div className="step-content">
                                             <span className="step-message">{step.message}</span>
