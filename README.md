@@ -1,4 +1,4 @@
-# TalentScope — LinkedIn Candidate Discovery
+# Talentier — LinkedIn Candidate Discovery
 
 An AI-powered recruiter tool that finds real LinkedIn candidates based on technical skills, experience level, and location filters. Built with **React TSX** + **FastAPI** + **LangGraph** + **Ollama**.
 
