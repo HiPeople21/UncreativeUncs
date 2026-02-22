@@ -97,7 +97,7 @@ async def search_candidates(
     )
 
 
-@app.post("/api/pipeline")
+@app.get("/api/pipeline")
 async def run_pipeline(
     skills: Optional[str] = Query(None, description="Comma-separated list of skills"),
     experience_level: Optional[str] = Query(None, description="junior, mid, senior, lead, principal"),

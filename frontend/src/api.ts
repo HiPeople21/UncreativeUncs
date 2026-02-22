@@ -1,6 +1,6 @@
 /** API client for the FastAPI backend. */
 
-import type { SearchFilters, SearchResponse } from "./types";
+import type { Candidate, SearchFilters, SearchResponse } from "./types";
 
 const API_BASE = "http://localhost:8000";
 
@@ -30,11 +30,44 @@ export async function searchCandidates(
     }
     params.set("page", String(page));
 
-    const resp = await fetch(`${API_BASE}/api/candidates?${params.toString()}`);
+    const resp = await fetch(`${API_BASE}/api/pipeline?${params.toString()}`);
     if (!resp.ok) {
         throw new Error(`API error: ${resp.status}`);
     }
-    return resp.json();
+
+    const data = await resp.json();
+
+    // Map pipeline response to SearchResponse shape
+    const candidates: Candidate[] = (data.candidates ?? []).map((c: any) => {
+        const bestUrl =
+            c.profile_urls?.linkedin ||
+            c.profile_urls?.github ||
+            Object.values(c.profile_urls ?? {})[0] ||
+            "";
+        const nameParts = (c.name ?? "Unknown").split(" ");
+        const initials = nameParts
+            .slice(0, 2)
+            .map((p: string) => p[0]?.toUpperCase() ?? "")
+            .join("");
+
+        return {
+            id: c.canonical_id ?? "",
+            name: c.name ?? "Unknown",
+            headline: c.headline ?? "",
+            location: c.location ?? "",
+            profile_url: bestUrl,
+            snippet: c.final_score != null ? `Score: ${c.final_score}` : "",
+            matched_skills: c.skills ?? [],
+            avatar_initials: initials,
+        } satisfies Candidate;
+    });
+
+    return {
+        candidates,
+        total_results: data.total ?? candidates.length,
+        page,
+        has_more: false,
+    };
 }
 
 export function subscribeAgentStatus(
