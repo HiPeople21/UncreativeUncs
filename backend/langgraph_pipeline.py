@@ -8,6 +8,7 @@ from langgraph.graph import StateGraph, END, START
 from typing import Literal
 import hashlib
 import json
+import math
 from datetime import datetime, timezone
 
 from state import (
@@ -24,6 +25,8 @@ from state import (
     create_initial_state,
     get_all_source_results,
 )
+from github.tools import get_github_tools
+from github.code_quality_agent import get_code_quality_agent
 
 
 # ============================================================================
@@ -118,57 +121,96 @@ def linkedin_query_node(state: CandidateSourcingState) -> dict:
 
 
 def github_query_node(state: CandidateSourcingState) -> dict:
-    """Query GitHub and populate github_result."""
+    """Query GitHub repositories by tag and extract top contributors."""
     start_time = datetime.now(timezone.utc)
-    
+
     query_config = state["query_config"]
     github_tags = query_config.get("github_tags", [])
     min_stars = query_config.get("min_stars", 100)
-    
-    query_dict = {"tags": github_tags, "min_stars": min_stars}
+    language = query_config.get("language")
+    max_repos = query_config.get("max_repos", 30)
+    max_contributors = query_config.get("max_contributors_per_repo", 10)
+
+    query_dict = {"tags": github_tags, "min_stars": min_stars, "language": language}
     cache_key = hashlib.sha256(json.dumps(query_dict, sort_keys=True).encode()).hexdigest()
-    
+
     try:
-        # Import your GitHub tools
-        from github.tools import search_repositories, get_top_contributors
-        
-        # Query GitHub repositories
-        all_candidates = []
-        seen_users = set()
-        
+        github_tools = get_github_tools()
+
+        all_candidates: list[SourceCandidate] = []
+        seen_users: set[str] = set()
+        api_calls = 0
+
         for tag in github_tags:
-            repos = search_repositories(tag, min_stars=min_stars)
-            
-            for repo in repos:
-                contributors = get_top_contributors(
-                    repo["owner"]["login"],
-                    repo["name"],
-                    max_contributors=10
+            # Use the real RepositorySearcher
+            repo_response = github_tools.search_repos(
+                tag=tag,
+                language=language,
+                min_stars=min_stars,
+                max_results=max_repos,
+            )
+            api_calls += 1
+
+            if not repo_response.success:
+                continue
+
+            for repo_dict in repo_response.repositories:
+                owner_login = (repo_dict.get("owner") or {}).get("login", "")
+                repo_name = repo_dict.get("name", "")
+                if not owner_login or not repo_name:
+                    continue
+
+                # Use the real CommitAnalyzer via GitHubTools
+                contrib_response = github_tools.get_contributors(
+                    owner=owner_login,
+                    repo=repo_name,
+                    max_results=max_contributors,
                 )
-                
-                for contrib in contributors:
-                    if contrib["login"] in seen_users:
+                api_calls += 1
+
+                if not contrib_response.success:
+                    continue
+
+                for contrib in contrib_response.contributors:
+                    if contrib.login in seen_users:
+                        # If we already have this user, just append the repo
+                        for existing in all_candidates:
+                            if existing.source_id == contrib.login:
+                                existing.source_specific.setdefault("repos", []).append(
+                                    f"{owner_login}/{repo_name}"
+                                )
+                                existing.source_specific["total_contributions"] = (
+                                    existing.source_specific.get("total_contributions", 0)
+                                    + contrib.contributions
+                                )
+                                if tag not in existing.tags:
+                                    existing.tags.append(tag)
+                                break
                         continue
-                    
-                    seen_users.add(contrib["login"])
-                    
+
+                    seen_users.add(contrib.login)
+
                     candidate = SourceCandidate(
                         source=SourceType.GITHUB,
-                        source_id=contrib["login"],
-                        name=contrib.get("name", contrib["login"]),
-                        profile_url=contrib["html_url"],
-                        raw_data=contrib,
+                        source_id=contrib.login,
+                        name=contrib.login,
+                        profile_url=contrib.html_url or f"https://github.com/{contrib.login}",
+                        raw_data={
+                            "login": contrib.login,
+                            "contributions": contrib.contributions,
+                            "avatar_url": contrib.avatar_url,
+                            "html_url": contrib.html_url,
+                        },
                         source_specific={
-                            "contributions": contrib["contributions"],
-                            "repos": [repo["full_name"]],
-                            "primary_language": repo.get("language")
+                            "total_contributions": contrib.contributions,
+                            "repos": [f"{owner_login}/{repo_name}"],
+                            "primary_language": repo_dict.get("language"),
                         },
                         tags=[tag],
-                        query_fingerprint=cache_key
+                        query_fingerprint=cache_key,
                     )
-                    
                     all_candidates.append(candidate)
-        
+
         result = SourceResult(
             source=SourceType.GITHUB,
             candidates=all_candidates,
@@ -178,24 +220,25 @@ def github_query_node(state: CandidateSourcingState) -> dict:
             total_fetched=len(all_candidates),
             started_at=start_time,
             completed_at=datetime.now(timezone.utc),
-            fetch_time_ms=(datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            fetch_time_ms=(datetime.now(timezone.utc) - start_time).total_seconds() * 1000,
         )
-        
+
         metrics = StageMetrics(
             stage=PipelineStage.SOURCE_QUERY,
             started_at=start_time,
             completed_at=datetime.now(timezone.utc),
             duration_ms=(datetime.now(timezone.utc) - start_time).total_seconds() * 1000,
             items_out=len(all_candidates),
-            custom={"source": "github"}
+            api_calls=api_calls,
+            custom={"source": "github", "repos_searched": len(seen_users)},
         )
-        
+
         return {
             "github_result": result,
             "stage_metrics": [metrics],
-            "cache_keys": {"github_query": cache_key}
+            "cache_keys": {"github_query": cache_key},
         }
-        
+
     except Exception as e:
         error_dict = {
             "stage": PipelineStage.SOURCE_QUERY,
@@ -203,20 +246,17 @@ def github_query_node(state: CandidateSourcingState) -> dict:
             "error_type": type(e).__name__,
             "message": str(e),
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "recoverable": False
+            "recoverable": False,
         }
-        
+
         result = SourceResult(
             source=SourceType.GITHUB,
             query_fingerprint=cache_key,
             status="failed",
-            error=str(e)
+            error=str(e),
         )
-        
-        return {
-            "github_result": result,
-            "errors": [error_dict]
-        }
+
+        return {"github_result": result, "errors": [error_dict]}
 
 
 def linkedin_scoring_node(state: CandidateSourcingState) -> dict:
@@ -272,42 +312,126 @@ def linkedin_scoring_node(state: CandidateSourcingState) -> dict:
 
 
 def github_scoring_node(state: CandidateSourcingState) -> dict:
-    """Score GitHub candidates using LLM or code quality metrics."""
+    """Score GitHub candidates using contribution metrics and AI code quality analysis."""
     start_time = datetime.now(timezone.utc)
-    
+
     result = state["github_result"]
-    
+    query_config = state["query_config"]
+
     if result.status != "completed":
         return {}
-    
-    # TODO: Implement code quality scoring
-    # For now, use contribution count as proxy
+
+    github_tools = get_github_tools()
+    code_quality_agent = get_code_quality_agent()
+    max_commits_to_grade = query_config.get("max_commits_to_grade", 3)
+
+    llm_calls = 0
+    api_calls = 0
+
     for candidate in result.candidates:
-        contributions = candidate.source_specific.get("contributions", 0)
-        raw_score = min(contributions / 10, 100)  # Cap at 100
-        
+        contributions = candidate.source_specific.get("total_contributions", 0)
+        repos = candidate.source_specific.get("repos", [])
+        num_repos = len(repos)
+
+        # --- Component 1: Contribution activity score ---
+        activity_score = min(math.log1p(contributions) / math.log1p(1000) * 100, 100)
+
+        # --- Component 2: Repo breadth score ---
+        breadth_score = min(num_repos / 5 * 100, 100)
+
+        # --- Component 3: Code quality via CodeQualityAgent (sample commits) ---
+        quality_score = 50.0  # default if we can't fetch commits
+        quality_details: dict = {}
+        graded_commits = 0
+
+        if repos and max_commits_to_grade > 0:
+            # Pick the first repo and sample commits
+            sample_repo = repos[0]
+            parts = sample_repo.split("/", 1)
+            if len(parts) == 2:
+                owner, repo_name = parts
+                try:
+                    commits_response = github_tools.get_commits(
+                        owner=owner,
+                        repo=repo_name,
+                        contributor=candidate.source_id,
+                        max_results=max_commits_to_grade,
+                    )
+                    api_calls += 1
+
+                    if commits_response.success and commits_response.commits:
+                        total_quality = 0.0
+                        for commit in commits_response.commits:
+                            if not commit.diff:
+                                continue
+                            metric = code_quality_agent.analyze_commit(
+                                commit_sha=commit.sha,
+                                diff=commit.diff,
+                                message=commit.message,
+                            )
+                            llm_calls += 1
+                            graded_commits += 1
+                            total_quality += metric.overall_score
+                            quality_details[commit.sha[:8]] = {
+                                "overall": metric.overall_score,
+                                "maintainability": metric.maintainability,
+                                "readability": metric.readability,
+                                "complexity": metric.complexity,
+                                "performance": metric.performance,
+                                "security": metric.security,
+                            }
+
+                        if graded_commits > 0:
+                            quality_score = total_quality / graded_commits
+                except Exception:
+                    pass  # graceful degradation — keep default quality_score
+
+        # --- Combine component scores ---
+        raw_score = (
+            0.35 * activity_score
+            + 0.15 * breadth_score
+            + 0.50 * quality_score
+        )
+
+        component_scores = {
+            "activity_score": round(activity_score, 2),
+            "breadth_score": round(breadth_score, 2),
+            "code_quality_score": round(quality_score, 2),
+            "total_contributions": contributions,
+            "repos_count": num_repos,
+            "commits_graded": graded_commits,
+        }
+
+        reasoning_parts = [
+            f"{contributions} contributions across {num_repos} repos",
+            f"activity={activity_score:.0f}",
+            f"breadth={breadth_score:.0f}",
+            f"code_quality={quality_score:.0f} ({graded_commits} commits graded)",
+        ]
+
         score_metadata = ScoreMetadata(
             score_type=ScoreType.RAW,
-            raw_value=raw_score,
-            model_name="placeholder",
+            raw_value=round(raw_score, 2),
+            model_name="github_composite+code_quality_agent",
             model_version="1.0.0",
             source=SourceType.GITHUB,
-            component_scores={
-                "contributions": contributions,
-                "activity_score": raw_score
-            },
-            reasoning=f"{contributions} contributions"
+            component_scores=component_scores,
+            reasoning="; ".join(reasoning_parts),
         )
-        
+
         candidate.scores.append(score_metadata)
-    
+
+        # Attach code quality details for downstream auditability
+        if quality_details:
+            candidate.source_specific["code_quality_details"] = quality_details
+
     # Normalize
     ranker = DefaultRankingStrategy()
     result.candidates = ranker.normalize_scores(result.candidates, SourceType.GITHUB)
-    
+
     result.total_scored = len(result.candidates)
     result.score_time_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-    
+
     metrics = StageMetrics(
         stage=PipelineStage.SOURCE_SCORING,
         started_at=start_time,
@@ -315,13 +439,15 @@ def github_scoring_node(state: CandidateSourcingState) -> dict:
         duration_ms=(datetime.now(timezone.utc) - start_time).total_seconds() * 1000,
         items_in=len(result.candidates),
         items_out=len(result.candidates),
-        custom={"source": "github"}
+        llm_calls=llm_calls,
+        api_calls=api_calls,
+        custom={"source": "github", "total_commits_graded": sum(
+            c.source_specific.get("code_quality_details", {}).__len__()
+            for c in result.candidates
+        )},
     )
-    
-    return {
-        "github_result": result,
-        "stage_metrics": [metrics]
-    }
+
+    return {"github_result": result, "stage_metrics": [metrics]}
 
 
 def identity_resolution_node(state: CandidateSourcingState) -> dict:
