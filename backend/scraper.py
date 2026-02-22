@@ -1,6 +1,6 @@
 """
 Candidate search pipeline:
-  1. Ollama extracts keywords + generates prestige-targeted LinkedIn query from description
+  1. Claude extracts keywords + generates prestige-targeted LinkedIn query from description
   2. LinkedIn: single DDG query targeting elite companies/universities (no concurrent = no rate limit)
   3. GitHub: repos → contributors → commit analysis via Ollama → code quality score
   4. LinkedIn candidates scored with prestige bonus (+20 top company, +10 top school)
@@ -307,7 +307,7 @@ def _get_user_best_repo(username: str) -> tuple[str, str] | None:
 def _enhance_linkedin_with_github(candidate: Candidate) -> Candidate:
     """
     If the LinkedIn snippet mentions a GitHub URL, fetch their commits, run
-    Ollama code-quality analysis, and blend the score:
+    Claude code-quality analysis, and blend the score:
         blended = linkedin_score × 0.6 + code_quality × 0.4
     Returns the (possibly enhanced) candidate.
     """

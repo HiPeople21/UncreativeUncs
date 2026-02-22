@@ -1,11 +1,11 @@
 # Talentier — LinkedIn Candidate Discovery
 
-An AI-powered recruiter tool that finds real LinkedIn candidates based on technical skills, experience level, and location filters. Built with **React TSX** + **FastAPI** + **LangGraph** + **Ollama**.
+An AI-powered recruiter tool that finds real LinkedIn candidates based on technical skills, experience level, and location filters. Built with **React TSX** + **FastAPI** + **LangGraph** + **Claude (Sonnet 4.6)**.
 
 ## Architecture
 
 ```
-React TSX (Vite) → FastAPI → LangGraph Agent → Ollama (llama3.2)
+React TSX (Vite) → FastAPI → LangGraph Agent → Claude (Sonnet 4.6)
                                     ↓
                               DuckDuckGo Search
                             (real LinkedIn profiles)
@@ -22,26 +22,10 @@ The LangGraph agent runs a multi-step pipeline:
 
 - **Python 3.10+**
 - **Node.js 18+**
-- **Ollama** with GPU support (recommended)
 
 ## Setup
 
-### 1. Install Ollama (with GPU support)
-
-```bash
-# Install native Ollama (includes CUDA/GPU support)
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Pull the model
-ollama pull llama3.2
-
-# Start the server
-ollama serve
-```
-
-> **Note:** If you previously installed Ollama via snap, remove it first with `sudo snap remove ollama` — the snap version doesn't support GPU acceleration.
-
-### 2. Backend
+### 1. Backend
 
 ```bash
 cd backend
@@ -52,9 +36,14 @@ source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Setup environment variable
+cp .env.sample .env
 ```
 
-### 3. Frontend
+Update `.env` with actual API keys.
+
+### 2. Frontend
 
 ```bash
 cd frontend
@@ -63,18 +52,15 @@ npm install
 
 ## Running
 
-Open **three terminals**:
+Open **two terminals**:
 
 ```bash
-# Terminal 1 — Ollama
-ollama serve
-
-# Terminal 2 — Backend
+# Terminal 1 — Backend
 cd backend
 source venv/bin/activate
 uvicorn main:app --reload --port 8000
 
-# Terminal 3 — Frontend
+# Terminal 2 — Frontend
 cd frontend
 npm run dev
 ```
@@ -96,6 +82,6 @@ Open **http://localhost:5173** in your browser.
 | Frontend | React, TypeScript, Vite |
 | Backend | FastAPI, Python |
 | AI Agent | LangGraph, LangChain |
-| LLM | Ollama (llama3.2) |
+| LLM | Claude (Sonnet 4.6) |
 | Search | DuckDuckGo HTML |
 | Styling | Vanilla CSS (dark theme, glassmorphism) |
