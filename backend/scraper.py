@@ -1,9 +1,10 @@
 """
 Candidate search pipeline:
-  1. Ollama extracts keywords from free-text description
-  2. LinkedIn: single DDG query (no concurrent requests = no rate limiting)
+  1. Ollama extracts keywords + generates prestige-targeted LinkedIn query from description
+  2. LinkedIn: single DDG query targeting elite companies/universities (no concurrent = no rate limit)
   3. GitHub: repos → contributors → commit analysis via Ollama → code quality score
-  4. All candidates scored 1-100, sorted, and returned
+  4. LinkedIn candidates scored with prestige bonus (+20 top company, +10 top school)
+  5. All candidates scored 1-100, sorted, and returned
 """
 
 import asyncio
@@ -27,7 +28,8 @@ GITHUB_TIMEOUT = 180      # Includes Ollama commit analysis time
 OLLAMA_TIMEOUT = 30
 MAX_DDG_RESULTS = 50
 MAX_GITHUB_REPOS = 2
-MAX_GITHUB_CONTRIBS = 8   # Per repo — keeps analysis within timeout
+MAX_GITHUB_FETCH_CONTRIBS = 30  # How many contributors to pull from GitHub per repo
+MAX_GITHUB_ANALYZE = 8          # How many of those to run through Ollama commit review
 MAX_COMMITS_PER_CONTRIB = 2
 OLLAMA_MODEL = "llama3"
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -47,25 +49,56 @@ def _ollama(prompt: str, timeout: int = OLLAMA_TIMEOUT) -> str:
     return resp.json().get("response", "").strip()
 
 
-def _extract_keywords(description: str) -> list[str]:
-    print("[Ollama] Extracting keywords from description...")
+def _extract_keywords_and_query(
+    description: str, exp_level: str, location: str
+) -> tuple[list[str], str | None]:
+    """
+    Single Ollama call: extracts keywords AND generates a prestige-targeted LinkedIn
+    search query. Returns (keywords, linkedin_query_or_None).
+    """
+    print("[Ollama] Generating keywords + prestige-targeted LinkedIn query...")
+    exp_hint = f"Experience level: {exp_level}" if exp_level else ""
+    loc_hint = f"Location: {location}" if location else ""
+    context = "\n".join(filter(None, [exp_hint, loc_hint]))
+
     prompt = (
-        "Extract the most important technical skills and job-related keywords from this "
-        "job description. Return ONLY a comma-separated list of 3-8 terms, no explanation.\n\n"
-        f"Description: {description}"
+        "You are a technical recruiter assistant. Given a job description, do TWO things:\n\n"
+        "1. Extract 3-8 key technical skills or domain keywords.\n"
+        "2. Write ONE optimal DuckDuckGo search query to find ELITE candidates on LinkedIn. "
+        "The query MUST start with 'site:linkedin.com/in' and should target prestigious "
+        "employers or top universities using OR groups when relevant to the role. "
+        "Good prestige employers include: Google, DeepMind, OpenAI, Anthropic, Meta, "
+        "Microsoft, Apple, Amazon, NVIDIA, Tesla, Stripe, Databricks, Jane Street, "
+        "Two Sigma, Citadel, Palantir, Hugging Face, Cohere, Mistral. "
+        "Good prestige universities include: MIT, Stanford, CMU, Harvard, Caltech, "
+        "Berkeley, Oxford, Cambridge, ETH Zurich, Imperial, Princeton, Cornell. "
+        "Include 3-5 prestige options using OR. Also include the core job title/skill "
+        "and experience level if provided. Keep the query under 120 chars.\n\n"
+        f"Job description: {description}\n"
+        f"{context}\n\n"
+        "Return ONLY valid JSON with this exact structure (no extra text):\n"
+        '{"keywords": ["skill1", "skill2"], "linkedin_query": "site:linkedin.com/in ..."}'
     )
     try:
-        raw = _ollama(prompt)
-        keywords = [
-            re.sub(r"^[\-\*\"\'\`\s]+|[\-\*\"\'\`\s]+$", "", k).strip()
-            for k in raw.split(",")
-        ]
-        keywords = [k for k in keywords if k and len(k) < 50]
-        print(f"[Ollama] Keywords: {keywords}")
-        return keywords
+        raw = _ollama(prompt, timeout=OLLAMA_TIMEOUT)
+        # Find JSON block — model sometimes wraps it in ```json ... ```
+        m = re.search(r'\{[^{}]*"keywords"[^{}]*\}', raw, re.DOTALL)
+        if m:
+            data = json.loads(m.group(0))
+            keywords = [
+                re.sub(r"^[\-\*\"\'\`\s]+|[\-\*\"\'\`\s]+$", "", k).strip()
+                for k in data.get("keywords", [])
+            ]
+            keywords = [k for k in keywords if k and len(k) < 50]
+            query = data.get("linkedin_query", "").strip()
+            if not query.startswith("site:linkedin.com/in"):
+                query = None
+            print(f"[Ollama] Keywords: {keywords}")
+            print(f"[Ollama] LinkedIn query: {query}")
+            return keywords, query
     except Exception as e:
-        print(f"[Ollama] Keyword extraction failed: {e}")
-        return []
+        print(f"[Ollama] Combined extraction failed: {e}")
+    return [], None
 
 
 def _analyze_commits(login: str, owner: str, repo: str, commits: list) -> tuple[int, str]:
@@ -118,15 +151,60 @@ def _canonicalize_url(url: str) -> str:
 
 
 def _build_linkedin_query(filters: SearchFilters) -> str:
-    skills = filters.skills[:2]
+    """Fallback LinkedIn query when Ollama is unavailable. Includes prestige targeting."""
+    skills = filters.skills[:3]
     location = (filters.location or "").strip()
     level = (filters.experience_level or "").strip().lower()
-    exp_prefix = {"senior": "senior", "lead": "lead", "principal": "principal"}.get(level, "")
+    exp_prefix = {"senior": "senior", "lead": "lead", "principal": "principal", "junior": "junior"}.get(level, "")
     terms = " ".join(skills) if skills else "software engineer"
     base = f"{exp_prefix} {terms}".strip() if exp_prefix else terms
+    prestige = "(Google OR OpenAI OR Meta OR Microsoft OR DeepMind)"
     if location:
-        return f"site:linkedin.com/in {base} {location}"
-    return f"site:linkedin.com/in {base}"
+        return f"site:linkedin.com/in {base} {prestige} {location}"
+    return f"site:linkedin.com/in {base} {prestige}"
+
+
+# ── Prestige scoring ──────────────────────────────────────────────────
+_PRESTIGE_COMPANIES = {
+    "google", "deepmind", "google deepmind", "openai", "anthropic", "meta", "facebook",
+    "microsoft", "apple", "amazon", "aws", "nvidia", "tesla", "spacex", "netflix",
+    "stripe", "databricks", "hugging face", "huggingface", "cohere", "mistral",
+    "stability ai", "scale ai", "anyscale", "replicate", "weights & biases", "wandb",
+    "fair", "msr", "microsoft research", "google brain", "google research",
+    "allen institute", "ai2", "jane street", "two sigma", "citadel", "d.e. shaw",
+    "renaissance", "palantir", "mckinsey", "goldman sachs", "jp morgan",
+    "deepseek", "xai", "inflection", "adept", "together ai",
+}
+
+_PRESTIGE_SCHOOLS = {
+    "mit", "stanford", "carnegie mellon", "cmu", "harvard", "caltech",
+    "berkeley", "uc berkeley", "cambridge", "oxford", "eth zurich",
+    "imperial college", "imperial", "princeton", "yale", "columbia",
+    "georgia tech", "gatech", "cornell", "toronto", "waterloo",
+    "university of toronto", "university of cambridge", "university of oxford",
+    "tsinghua", "peking university", "epfl",
+}
+
+
+_RESEARCH_TERMS = {
+    "phd", "ph.d", "ph.d.", "researcher", "research scientist", "research engineer",
+    "research lead", "research director", "professor", "postdoc", "postdoctoral",
+    "doctoral", "dissertation", "publications", "published", "arxiv",
+    "paper", "papers", "co-author", "first author", "principal investigator",
+    "machine learning researcher", "ai researcher", "deep learning researcher",
+}
+
+
+def _compute_prestige_breakdown(text: str) -> tuple[int, int, int]:
+    """
+    Returns (company_score 0-30, school_score 0-20, research_score 0-20).
+    All three stack — a Stanford PhD at Nvidia = 30+20+20 = 70 prestige points.
+    """
+    lowered = text.lower()
+    company = 35 if any(c in lowered for c in _PRESTIGE_COMPANIES) else 0
+    school = 20 if any(s in lowered for s in _PRESTIGE_SCHOOLS) else 0
+    research = 20 if any(t in lowered for t in _RESEARCH_TERMS) else 0
+    return company, school, research
 
 
 _GITHUB_TAG_MAP = {
@@ -265,30 +343,37 @@ def _search_linkedin(query: str) -> list[dict]:
 
 
 def _score_linkedin(matched_skills: list[str], total_skills: int, exp_level: str,
-                    location: str, required_exp: str, required_loc: str) -> tuple[int, str]:
-    """Score a LinkedIn candidate 1-100 using a deterministic formula.
+                    location: str, required_exp: str, required_loc: str,
+                    company_prestige: int = 0, school_prestige: int = 0,
+                    research_score: int = 0) -> tuple[int, str]:
+    """Score a LinkedIn candidate 1-100.
 
-    LinkedIn profiles are weighted higher than GitHub contributors — they represent
-    verified professional experience. +15 source bonus over equivalent GitHub score.
+    Prestige (company + school + research) is the dominant signal. Scores are
+    calibrated so top-tier candidates land 90-100 and typical LinkedIn hits 30-50.
+      linkedin bonus : 20     (always — verified professional profile baseline)
+      prestige total : 0–72   (company 35 + school 20 + research 20, all stacking)
+      skill match    : 0–12
+      exp level      : 0–6
+      location match : 0–3
+    Total max ≈ 113 → capped at 100
     """
-    skill_score = int((len(matched_skills) / max(total_skills, 1)) * 55)  # 0-55
+    skill_score = int((len(matched_skills) / max(total_skills, 1)) * 12)  # 0-12
+    exp_score = 6 if (required_exp and required_exp.lower() in exp_level.lower()) else 0
+    loc_score = 3 if (required_loc and required_loc.lower() in location.lower()) else 0
+    linkedin_bonus = 20
+    prestige_total = min(72, company_prestige + school_prestige + research_score)
 
-    exp_score = 0
-    if required_exp and required_exp.lower() in exp_level.lower():
-        exp_score = 20
-
-    loc_score = 0
-    if required_loc and required_loc.lower() in location.lower():
-        loc_score = 15
-
-    linkedin_bonus = 10   # professional profile weight vs GitHub code-only score
-    quality_score = 0     # replaced by linkedin_bonus
-
-    score = max(1, min(100, skill_score + exp_score + loc_score + linkedin_bonus + quality_score))
+    score = max(1, min(100, skill_score + exp_score + loc_score + linkedin_bonus + prestige_total))
 
     reasons = []
+    if company_prestige:
+        reasons.append("top-tier tech company")
+    if school_prestige:
+        reasons.append("elite university")
+    if research_score:
+        reasons.append("research/PhD background")
     if matched_skills:
-        reasons.append(f"matches {len(matched_skills)} required skill(s): {', '.join(matched_skills[:3])}")
+        reasons.append(f"matches {len(matched_skills)} skill(s): {', '.join(matched_skills[:3])}")
     if exp_score:
         reasons.append(f"{required_exp} experience level")
     if loc_score:
@@ -314,20 +399,39 @@ def _parse_linkedin_result(result: dict, search_skills: list[str], exp_level: st
         return None
 
     candidate_location = ""
-    for pattern in [
-        r"(?:Location|Area|Region|Based in)[:\s]+([^·\n.]+)",
-        r"(?:located in|based in)\s+([^·\n.]+)",
-    ]:
-        m = re.search(pattern, snippet, re.IGNORECASE)
+    # Try multiple patterns roughly ordered by confidence
+    _loc_patterns = [
+        # Explicit label: "Location: San Francisco"
+        r"(?:Location|Area|Region|Based in)[:\s]+([^·|\n]{3,50})",
+        r"(?:located in|based in)\s+([^·|\n.]{3,50})",
+        # LinkedIn dot-separator format: "· San Francisco, CA ·"
+        r"·\s*([A-Z][a-zA-Z\s]{2,30}(?:,\s*[A-Z][a-zA-Z\s]{2,30})?)\s*·",
+        # "City, Country" pattern at sentence boundary
+        r"\b([A-Z][a-zA-Z ]{2,25},\s*(?:United States|United Kingdom|UK|Canada|Australia|"
+        r"Germany|France|Netherlands|Sweden|Switzerland|India|Singapore|Japan|China|Israel|"
+        r"Brazil|Norway|Denmark|Finland|Spain|Italy|South Korea))\b",
+        # Well-known metro area phrases
+        r"((?:San Francisco|New York|Greater London|Greater NYC|Bay Area|"
+        r"Silicon Valley|Greater Boston|Greater Seattle|Greater Chicago|"
+        r"Greater Los Angeles|Greater Toronto|Greater Vancouver|Greater Berlin|"
+        r"Greater Munich)[a-zA-Z\s,]*(?:Area|Region|Metro)?)",
+        # "City, ST" US two-letter state
+        r"\b([A-Z][a-zA-Z ]{2,20},\s*[A-Z]{2})\b",
+    ]
+    for pattern in _loc_patterns:
+        m = re.search(pattern, f"{title} {snippet}", re.IGNORECASE)
         if m:
-            candidate_location = m.group(1).strip()[:50]
+            candidate_location = m.group(1).strip()[:60]
             break
 
     full_text = f"{title} {snippet}".lower()
     matched = [s for s in search_skills if s.lower() in full_text]
 
+    company_p, school_p, research_p = _compute_prestige_breakdown(f"{title} {snippet}")
+
     score, summary = _score_linkedin(
-        matched, len(search_skills), headline, candidate_location, exp_level, location
+        matched, len(search_skills), headline, candidate_location, exp_level, location,
+        company_prestige=company_p, school_prestige=school_p, research_score=research_p,
     )
 
     cid = hashlib.md5(url.encode()).hexdigest()[:12]
@@ -348,12 +452,15 @@ def _parse_linkedin_result(result: dict, search_skills: list[str], exp_level: st
 
 
 # ── GitHub search + commit analysis ──────────────────────────────────
+MIN_GITHUB_STARS = 5000  # Target high-profile repos (OpenCV, YOLO, etc.)
+
+
 def _find_github_repos(gh, tags: list[str], max_results: int) -> list[dict]:
     """Try combined tag search first, then fall back to individual tags."""
     # Try combined OR search first
     if len(tags) > 1:
         resp = gh.search_repos_by_impact(
-            tags=tags, min_stars=100, match_all_tags=False, max_results=max_results
+            tags=tags, min_stars=MIN_GITHUB_STARS, match_all_tags=False, max_results=max_results
         )
         print(f"[GitHub] Combined search ({tags}): success={resp.success}, found={len(resp.repositories)}, error={resp.error}")
         if resp.success and resp.repositories:
@@ -364,7 +471,7 @@ def _find_github_repos(gh, tags: list[str], max_results: int) -> list[dict]:
     merged: list[dict] = []
     for tag in tags:
         resp = gh.search_repos_by_impact(
-            tags=[tag], min_stars=100, match_all_tags=False, max_results=max_results * 2
+            tags=[tag], min_stars=MIN_GITHUB_STARS, match_all_tags=False, max_results=max_results * 2
         )
         print(f"[GitHub] Tag '{tag}': success={resp.success}, found={len(resp.repositories)}, error={resp.error}")
         if resp.success:
@@ -409,19 +516,25 @@ def _search_github_with_analysis(skills: list[str]) -> list[Candidate]:
 
         print(f"[GitHub] Processing {owner}/{repo_name}...")
         try:
-            contrib_resp = gh.get_contributors(owner, repo_name, max_results=MAX_GITHUB_CONTRIBS)
+            contrib_resp = gh.get_contributors(owner, repo_name, max_results=MAX_GITHUB_FETCH_CONTRIBS)
             if not contrib_resp.success:
                 continue
         except Exception as e:
             print(f"[GitHub] Contributors failed for {owner}/{repo_name}: {e}")
             continue
 
-        print(f"[GitHub] Analyzing {len(contrib_resp.contributors)} contributors for {owner}/{repo_name}...")
+        fetched = len(contrib_resp.contributors)
+        analyze_limit = MAX_GITHUB_ANALYZE - len(candidates)  # budget remaining
+        print(f"[GitHub] Fetched {fetched} contributors for {owner}/{repo_name}, analyzing top {analyze_limit}...")
+        analyzed = 0
         for contributor in contrib_resp.contributors:
+            if analyzed >= analyze_limit:
+                break
             login = contributor.login
             if login in seen_logins:
                 continue
             seen_logins.add(login)
+            analyzed += 1
 
             # Fetch commits for code quality analysis
             commits = []
@@ -434,9 +547,9 @@ def _search_github_with_analysis(skills: list[str]) -> list[Candidate]:
 
             code_score, summary = _analyze_commits(login, owner, repo_name, commits)
 
-            # GitHub score capped at 65 so LinkedIn profiles (which carry verified
-            # professional experience) naturally rank above equivalent GitHub contributors.
-            final_score = max(1, min(65, int(code_score * 0.35 + 30)))
+            # Capped at 50: prestige LinkedIn profiles (company + school + research)
+            # should always outrank pure code contributors.
+            final_score = max(1, min(50, int(code_score * 0.25 + 20)))
 
             github_url = f"https://github.com/{login}"
             cid = hashlib.md5(github_url.encode()).hexdigest()[:12]
@@ -485,13 +598,20 @@ async def stream_candidate_search(filters: SearchFilters):
             }
             return
 
-    # Step 1: Extract keywords from description via Ollama
+    # Step 1: Extract keywords + generate prestige-targeted LinkedIn query via Ollama
     skills = list(filters.skills)
+    ollama_linkedin_query: str | None = None
+
     if filters.description and filters.description.strip():
         yield {"type": "progress", "stage": "analyze", "message": "Analyzing your requirements with AI..."}
         try:
-            extracted = await asyncio.wait_for(
-                asyncio.to_thread(_extract_keywords, filters.description),
+            extracted, ollama_linkedin_query = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _extract_keywords_and_query,
+                    filters.description,
+                    filters.experience_level or "",
+                    filters.location or "",
+                ),
                 timeout=float(OLLAMA_TIMEOUT),
             )
             seen_lower = {s.lower() for s in skills}
@@ -504,7 +624,8 @@ async def stream_candidate_search(filters: SearchFilters):
             print(f"[Ollama] Skipping extraction: {e}")
 
     merged_filters = filters.model_copy(update={"skills": skills})
-    linkedin_query = _build_linkedin_query(merged_filters)
+    # Use Ollama-generated prestige query if available; fall back to deterministic builder
+    linkedin_query = ollama_linkedin_query or _build_linkedin_query(merged_filters)
     print(f"[Search] LinkedIn query: {linkedin_query}")
     print(f"[Search] GitHub skills: {skills}")
 
